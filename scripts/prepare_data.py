@@ -11,13 +11,9 @@ dataset = load_dataset(
 
 print(f"Full dataset: {len(dataset):,} examples")
 
-# First 10,000 examples for our initial experiment
 dataset = dataset.select(range(10_000))
-
-# Shuffle so we don't accidentally train on an ordered subset
 dataset = dataset.shuffle(seed=42)
 
-# 90/10 train/validation split
 split = dataset.train_test_split(
     test_size=0.1,
     seed=42
@@ -32,4 +28,23 @@ print(f"Validation: {len(validation):,}")
 train.save_to_disk("data/processed/train")
 validation.save_to_disk("data/processed/validation")
 
-print("Dataset prepared successfully.")
+print("\nDataset prepared successfully.")
+
+# Show examples
+print("\n========== EXAMPLE 1 ==========")
+
+for message in train[0]["messages"]:
+    print(f"\n[{message['role'].upper()}]")
+    print(message["content"])
+
+print("\n========== EXAMPLE 2 ==========")
+
+for message in train[1]["messages"]:
+    print(f"\n[{message['role'].upper()}]")
+    print(message["content"])
+
+print("\n========== EXAMPLE 3 ==========")
+
+for message in train[2]["messages"]:
+    print(f"\n[{message['role'].upper()}]")
+    print(message["content"])
