@@ -1,18 +1,3 @@
-"""
-QLoRA fine-tuning script.
-
-Project:
-    Small GPT-like conversational LLM
-
-Hardware target:
-    NVIDIA RTX 4060 Laptop GPU - 8 GB VRAM
-    16 GB system RAM
-
-This first version runs a small 20-step test.
-Once the test succeeds, remove MAX_STEPS to perform
-the full training run.
-"""
-
 import os
 import torch
 
@@ -22,470 +7,305 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
-
 from peft import (
     LoraConfig,
     prepare_model_for_kbit_training,
 )
-
-from trl import (
-    SFTTrainer,
-    SFTConfig,
-)
+from trl import SFTConfig, SFTTrainer
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
 TRAIN_PATH = "data/processed/train_clean"
 VALIDATION_PATH = "data/processed/validation_clean"
 
-OUTPUT_DIR = "model/adapters/qwen-1.5b-ultrachat"
+OUTPUT_DIR = "outputs/qwen-3b-qlora"
 
-# ------------------------------------------------------------
-# TEST MODE
-# ------------------------------------------------------------
-# Keep this at 20 for the first run.
-#
-# After the test works, change:
-#
-#     MAX_STEPS = -1
-#
-# to train for the configured number of epochs.
-# ------------------------------------------------------------
+MAX_SEQ_LENGTH = 1024
 
-MAX_STEPS = 20
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
 
 NUM_EPOCHS = 1
+LEARNING_RATE = 2e-4
 
-# Sequence length.
-# 1024 is a safe starting point for an 8 GB GPU.
-MAX_LENGTH = 1024
+BATCH_SIZE_GPU = 1
+BATCH_SIZE_CPU = 1
 
+GRADIENT_ACCUMULATION_STEPS_GPU = 8
+GRADIENT_ACCUMULATION_STEPS_CPU = 2
 
-# ============================================================
-# GPU CHECK
-# ============================================================
+SEED = 42
 
-print("=" * 60)
-print("GPU INFORMATION")
-print("=" * 60)
 
-if not torch.cuda.is_available():
-    raise RuntimeError(
-        "CUDA is not available. "
-        "Make sure the CUDA version of PyTorch is installed."
-    )
-
-device = torch.cuda.current_device()
-
-gpu_name = torch.cuda.get_device_name(device)
-
-gpu_memory = (
-    torch.cuda.get_device_properties(device).total_memory
-    / 1024**3
-)
-
-print(f"GPU:  {gpu_name}")
-print(f"VRAM: {gpu_memory:.2f} GB")
-
-
-# ============================================================
-# LOAD TOKENIZER
-# ============================================================
-
-print("\n" + "=" * 60)
-print("LOADING TOKENIZER")
-print("=" * 60)
-
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME
-)
-
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-print("Tokenizer loaded.")
-
-print(f"Vocabulary size: {len(tokenizer):,}")
-
-if tokenizer.chat_template is None:
-    raise RuntimeError(
-        "The tokenizer does not have a chat template. "
-        "A conversational dataset requires a chat template."
-    )
-
-print("Chat template: available")
-
-
-# ============================================================
-# 4-BIT QUANTIZATION
-# ============================================================
-
-print("\n" + "=" * 60)
-print("CREATING 4-BIT QLoRA CONFIGURATION")
-print("=" * 60)
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-
-    # NF4 is recommended for QLoRA
-    bnb_4bit_quant_type="nf4",
-
-    # Saves additional memory
-    bnb_4bit_use_double_quant=True,
-
-    # RTX 4060 supports FP16
-    bnb_4bit_compute_dtype=torch.float16,
-)
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-print("\n" + "=" * 60)
-print("LOADING MODEL")
-print("=" * 60)
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-
-    quantization_config=bnb_config,
-
-    device_map="auto",
-
-    # Don't use cache during gradient checkpointing
-    torch_dtype=torch.float16,
-)
-
-model.config.use_cache = False
-
-print("Model loaded successfully.")
-
-print(f"Model device: {model.device}")
-
-
-# ============================================================
-# PREPARE MODEL FOR QLoRA
-# ============================================================
-
-print("\nPreparing model for k-bit training...")
-
-model = prepare_model_for_kbit_training(model)
-
-print("Model prepared.")
-
-
-# ============================================================
-# LoRA CONFIGURATION
-# ============================================================
-
-print("\n" + "=" * 60)
-print("CREATING LoRA CONFIGURATION")
-print("=" * 60)
-
-peft_config = LoraConfig(
-    r=16,
-
-    lora_alpha=32,
-
-    lora_dropout=0.05,
-
-    bias="none",
-
-    task_type="CAUSAL_LM",
-
-    # Apply LoRA to the linear layers.
-    # This works well with Qwen architectures.
-    target_modules="all-linear",
-)
-
-print("LoRA configuration created.")
-
-
-# ============================================================
-# LOAD DATASETS
-# ============================================================
-
-print("\n" + "=" * 60)
-print("LOADING CLEAN DATASETS")
-print("=" * 60)
-
-if not os.path.exists(TRAIN_PATH):
-    raise FileNotFoundError(
-        f"Training dataset not found:\n{TRAIN_PATH}"
-    )
-
-if not os.path.exists(VALIDATION_PATH):
-    raise FileNotFoundError(
-        f"Validation dataset not found:\n{VALIDATION_PATH}"
-    )
-
-train_dataset = load_from_disk(TRAIN_PATH)
-
-validation_dataset = load_from_disk(
-    VALIDATION_PATH
-)
-
-print(f"Training examples:   {len(train_dataset):,}")
-print(f"Validation examples: {len(validation_dataset):,}")
-
-
-# ============================================================
-# VERIFY DATA FORMAT
-# ============================================================
-
-print("\nChecking dataset format...")
-
-if "messages" not in train_dataset.column_names:
-    raise RuntimeError(
-        "Training dataset does not contain a 'messages' column."
-    )
-
-if "messages" not in validation_dataset.column_names:
-    raise RuntimeError(
-        "Validation dataset does not contain a 'messages' column."
-    )
-
-example = train_dataset[0]
-
-print("Dataset format: conversational")
-print("Column: messages")
-
-print("\nFirst conversation roles:")
-
-for message in example["messages"]:
-    print(f"  {message['role']}")
-
-print("\nDataset format looks good.")
-
-
-# ============================================================
-# TRAINING CONFIGURATION
-# ============================================================
-
-print("\n" + "=" * 60)
-print("CREATING TRAINING CONFIGURATION")
-print("=" * 60)
-
-training_args = SFTConfig(
-
-    # --------------------------------------------------------
-    # Output
-    # --------------------------------------------------------
-
-    output_dir=OUTPUT_DIR,
-
-    # --------------------------------------------------------
-    # Training duration
-    # --------------------------------------------------------
-
-    num_train_epochs=NUM_EPOCHS,
-
-    # IMPORTANT:
-    # This limits the first test to only 20 steps.
-    max_steps=MAX_STEPS,
-
-    # --------------------------------------------------------
-    # Batch size
-    # --------------------------------------------------------
-
-    per_device_train_batch_size=1,
-
-    per_device_eval_batch_size=1,
-
-    # Simulates a larger batch while keeping VRAM usage low.
-    gradient_accumulation_steps=8,
-
-    # --------------------------------------------------------
-    # Learning rate
-    # --------------------------------------------------------
-
-    learning_rate=2e-4,
-
-    # --------------------------------------------------------
-    # Optimizer
-    # --------------------------------------------------------
-
-    optim="paged_adamw_8bit",
-
-    # --------------------------------------------------------
-    # Sequence length
-    # --------------------------------------------------------
-
-    max_length=MAX_LENGTH,
-
-    # --------------------------------------------------------
-    # MEMORY
-    # --------------------------------------------------------
-
-    gradient_checkpointing=True,
-
-    # IMPORTANT:
-    # Packing is disabled for the first test.
-    #
-    # This avoids the Flash Attention / padding-free warning
-    # you saw earlier.
-    packing=False,
-
-    # --------------------------------------------------------
-    # PRECISION
-    # --------------------------------------------------------
-
-    fp16=True,
-
-    bf16=False,
-
-    # --------------------------------------------------------
-    # LOGGING
-    # --------------------------------------------------------
-
-    logging_strategy="steps",
-
-    logging_steps=5,
-
-    # --------------------------------------------------------
-    # EVALUATION
-    # --------------------------------------------------------
-
-    eval_strategy="steps",
-
-    eval_steps=10,
-
-    # --------------------------------------------------------
-    # CHECKPOINTS
-    # --------------------------------------------------------
-
-    save_strategy="steps",
-
-    save_steps=10,
-
-    save_total_limit=1,
-
-    # --------------------------------------------------------
-    # DATASET
-    # --------------------------------------------------------
-
-    # We are using a conversational `messages` dataset.
-    #
-    # TRL will apply the Qwen chat template and tokenize it.
-    dataset_text_field=None,
-
-    # --------------------------------------------------------
-    # REPORTING
-    # --------------------------------------------------------
-
-    report_to="none",
-
-    # --------------------------------------------------------
-    # REPRODUCIBILITY
-    # --------------------------------------------------------
-
-    seed=42,
-)
-
-
-# ============================================================
-# CREATE TRAINER
-# ============================================================
-
-print("\n" + "=" * 60)
-print("CREATING SFT TRAINER")
-print("=" * 60)
-
-trainer = SFTTrainer(
-
-    model=model,
-
-    args=training_args,
-
-    train_dataset=train_dataset,
-
-    eval_dataset=validation_dataset,
-
-    processing_class=tokenizer,
-
-    peft_config=peft_config,
-)
-
-print("SFTTrainer created successfully.")
-
-
-# ============================================================
-# TRAIN
-# ============================================================
-
-print("\n")
-print("=" * 60)
-print("STARTING QLoRA TRAINING")
-print("=" * 60)
-
-print(f"Model:        {MODEL_NAME}")
-print(f"Training data: {len(train_dataset):,}")
-print(f"Validation:    {len(validation_dataset):,}")
-print(f"Max length:    {MAX_LENGTH}")
-print(f"Batch size:    1")
-print(f"Accumulation:  8")
-print(f"Max steps:     {MAX_STEPS}")
-print("=" * 60)
-
-trainer.train()
-
-
-# ============================================================
-# SAVE
-# ============================================================
-
-print("\n" + "=" * 60)
-print("SAVING LoRA ADAPTER")
-print("=" * 60)
-
-trainer.save_model(OUTPUT_DIR)
-
-tokenizer.save_pretrained(OUTPUT_DIR)
-
-print(f"\nAdapter saved to:")
-print(OUTPUT_DIR)
-
-
-# ============================================================
-# FINAL GPU INFORMATION
-# ============================================================
-
-if torch.cuda.is_available():
-
-    allocated = (
-        torch.cuda.memory_allocated()
-        / 1024**3
-    )
-
-    reserved = (
-        torch.cuda.memory_reserved()
-        / 1024**3
-    )
-
-    print("\n" + "=" * 60)
-    print("GPU MEMORY")
+def print_header(text):
+    print()
+    print("=" * 60)
+    print(text)
     print("=" * 60)
 
-    print(f"Allocated: {allocated:.2f} GB")
-    print(f"Reserved:  {reserved:.2f} GB")
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+
+    return "cpu"
 
 
-# ============================================================
-# DONE
-# ============================================================
+def format_conversation(example, tokenizer):
+    messages = example["messages"]
 
-print("\n" + "=" * 60)
-print("20-STEP TEST COMPLETE")
-print("=" * 60)
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 
-print("\nIf the loss values appeared and there was no CUDA")
-print("out-of-memory error, the training pipeline works.")
+    return {"text": text}
 
-print("\nNext step:")
-print("Remove/disable MAX_STEPS and start the full training run.")
+
+def main():
+
+    torch.manual_seed(SEED)
+
+    device = get_device()
+
+    print_header("DEVICE INFORMATION")
+
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+        print(f"Device: GPU")
+        print(f"GPU:    {gpu_name}")
+        print(f"VRAM:   {vram:.2f} GB")
+
+        use_4bit = True
+        use_fp16 = False
+        use_bf16 = False
+
+        batch_size = BATCH_SIZE_GPU
+        gradient_accumulation = GRADIENT_ACCUMULATION_STEPS_GPU
+
+    else:
+        print("Device: CPU")
+        print("No CUDA GPU detected.")
+
+        use_4bit = False
+        use_fp16 = False
+        use_bf16 = False
+
+        batch_size = BATCH_SIZE_CPU
+        gradient_accumulation = GRADIENT_ACCUMULATION_STEPS_CPU
+
+    print_header("LOADING TOKENIZER")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        use_fast=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"Tokenizer loaded.")
+    print(f"Vocabulary size: {len(tokenizer)}")
+
+    print_header("MODEL CONFIGURATION")
+
+    quantization_config = None
+
+    if use_4bit:
+
+        print("Using 4-bit NF4 QLoRA.")
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+
+    else:
+
+        print("Using CPU mode.")
+        print("4-bit quantization disabled.")
+
+    print_header("LOADING MODEL")
+
+    model_kwargs = {
+        "trust_remote_code": True,
+    }
+
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+        model_kwargs["device_map"] = {"": 0}
+
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        **model_kwargs,
+    )
+
+    print("Model loaded successfully.")
+
+    if device == "cuda":
+
+        print("Preparing model for k-bit training...")
+
+        model = prepare_model_for_kbit_training(model)
+
+        print("Model prepared.")
+
+    else:
+
+        model.gradient_checkpointing_enable()
+
+    model.config.use_cache = False
+
+    print_header("CREATING LoRA CONFIGURATION")
+
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+
+    print("LoRA configuration created.")
+
+    print_header("LOADING CLEAN DATASETS")
+
+    train_dataset = load_from_disk(TRAIN_PATH)
+    validation_dataset = load_from_disk(VALIDATION_PATH)
+
+    print(f"Training examples:   {len(train_dataset):,}")
+    print(f"Validation examples: {len(validation_dataset):,}")
+
+    print_header("CONVERTING CONVERSATIONS TO TEXT")
+
+    train_dataset = train_dataset.map(
+        lambda x: format_conversation(x, tokenizer),
+        remove_columns=train_dataset.column_names,
+        desc="Formatting training dataset",
+    )
+
+    validation_dataset = validation_dataset.map(
+        lambda x: format_conversation(x, tokenizer),
+        remove_columns=validation_dataset.column_names,
+        desc="Formatting validation dataset",
+    )
+
+    print("Dataset conversion complete.")
+
+    print()
+    print("Sample:")
+    print("-" * 60)
+    print(train_dataset[0]["text"][:3000])
+    print("-" * 60)
+
+    print_header("CREATING TRAINING CONFIGURATION")
+
+    training_args = SFTConfig(
+        output_dir=OUTPUT_DIR,
+
+        num_train_epochs=NUM_EPOCHS,
+
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=1,
+
+        gradient_accumulation_steps=gradient_accumulation,
+
+        learning_rate=LEARNING_RATE,
+
+        logging_steps=10,
+
+        save_steps=250,
+        save_total_limit=2,
+
+        eval_strategy="steps",
+        eval_steps=250,
+
+        fp16=use_fp16,
+        bf16=use_bf16,
+
+        gradient_checkpointing=True,
+
+        optim="paged_adamw_8bit" if device == "cuda" else "adamw_torch",
+
+        max_grad_norm=1.0,
+
+        lr_scheduler_type="cosine",
+
+        warmup_steps=50,
+
+        report_to="none",
+
+        seed=SEED,
+
+        max_length=MAX_SEQ_LENGTH,
+
+        packing=False,
+
+        dataset_text_field="text",
+
+        eos_token=tokenizer.eos_token,
+        pad_token=tokenizer.pad_token,
+
+        remove_unused_columns=False,
+    )
+
+    print_header("CREATING SFT TRAINER")
+
+    trainer = SFTTrainer(
+        model=model,
+
+        args=training_args,
+
+        train_dataset=train_dataset,
+
+        eval_dataset=validation_dataset,
+
+        processing_class=tokenizer,
+
+        peft_config=lora_config,
+    )
+
+    print_header("STARTING TRAINING")
+
+    print(f"Epochs:                 {NUM_EPOCHS}")
+    print(f"Batch size:             {batch_size}")
+    print(f"Gradient accumulation:  {gradient_accumulation}")
+    print(f"Effective batch size:   {batch_size * gradient_accumulation}")
+    print(f"Learning rate:          {LEARNING_RATE}")
+    print(f"Max sequence length:    {MAX_SEQ_LENGTH}")
+    print(f"Output directory:       {OUTPUT_DIR}")
+
+    trainer.train()
+
+    print_header("SAVING MODEL")
+
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+
+    print(f"Model saved to:")
+    print(OUTPUT_DIR)
+
+    print_header("TRAINING COMPLETE")
+
+
+if __name__ == "__main__":
+    main()
