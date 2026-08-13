@@ -1,28 +1,44 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+USE_GPU = torch.cuda.is_available()
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-print("Loading model in 4-bit...")
+if USE_GPU:
+    print(f"GPU detected: {torch.cuda.get_device_name(0)}")
+    print("Loading model in 4-bit on GPU...")
 
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-)
+    from transformers import BitsAndBytesConfig
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    quantization_config=quant_config,
-    device_map="auto",
-)
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=quant_config,
+        device_map="auto",
+    )
+
+else:
+    print("No GPU detected — loading model in full precision on CPU.")
+    print("This will use a few GB of RAM and generation will be slower.")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+    )
 
 print("Model loaded!")
-print("GPU:", torch.cuda.get_device_name(0))
+print("Device:", next(model.parameters()).device)
 
 messages = [
     {
@@ -38,6 +54,8 @@ text = tokenizer.apply_chat_template(
 )
 
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+print("\nGenerating response...")
 
 with torch.no_grad():
     outputs = model.generate(
