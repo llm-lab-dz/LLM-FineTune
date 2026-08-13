@@ -1,23 +1,73 @@
+# =========================
 # Python
+# =========================
 __pycache__/
 *.py[cod]
+*.pyo
 
-# Virtual environment
+# =========================
+# Virtual environments
+# =========================
 .venv/
 venv/
+env/
 
+# =========================
 # IDE
+# =========================
 .vscode/
+.idea/
 
+# =========================
 # Training data
-data/*.txt
-data/*.json
-data/*.jsonl
+# =========================
+data/raw/*
+data/processed/*
 
-# Model checkpoints
+# Keep directory structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# =========================
+# Models & checkpoints
+# =========================
+model/checkpoints/*
+model/adapters/*
 *.pt
 *.pth
+*.bin
+*.safetensors
 *.ckpt
 
-# Logs
+# Keep model directories
+!model/checkpoints/.gitkeep
+!model/adapters/.gitkeep
+
+# =========================
+# Hugging Face cache
+# =========================
+.huggingface/
+.cache/
+.cache/huggingface/
+**/.cache/
+
+# =========================
+# Logs & training output
+# =========================
 *.log
+runs/
+wandb/
+tensorboard/
+outputs/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Secrets
+# =========================
+.env
+*.env
