@@ -1,7 +1,6 @@
 import os
-os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
-
 import torch
+
 from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, prepare_model_for_kbit_training
@@ -68,14 +67,14 @@ def main():
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.float32,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         quantization_config=quantization_config,
         device_map={"": local_rank},
-        dtype=torch.float16,
+        dtype=torch.float32,
         trust_remote_code=True,
     )
 
@@ -129,7 +128,7 @@ def main():
         save_total_limit=2,
         eval_strategy="steps",
         eval_steps=250,
-        fp16=True,
+        fp16=False,
         bf16=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
