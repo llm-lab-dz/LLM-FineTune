@@ -14,6 +14,10 @@ from peft import (
 from trl import SFTConfig, SFTTrainer
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
 TRAIN_PATH = "data/processed/train_clean"
@@ -23,37 +27,47 @@ OUTPUT_DIR = "outputs/qwen-3b-qlora"
 
 MAX_SEQ_LENGTH = 1024
 
+# LoRA
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 
+# Training
 NUM_EPOCHS = 1
 LEARNING_RATE = 2e-4
 
+# 2 x T4
 BATCH_SIZE_GPU = 1
-BATCH_SIZE_CPU = 1
 
-GRADIENT_ACCUMULATION_STEPS_GPU = 8
-GRADIENT_ACCUMULATION_STEPS_CPU = 2
+# With 2 GPUs:
+# 1 sample/GPU × 2 GPUs × 4 accumulation = effective batch 8
+GRADIENT_ACCUMULATION_STEPS_GPU = 4
 
 SEED = 42
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def print_header(text):
     print()
-    print("=" * 60)
+    print("=" * 70)
     print(text)
-    print("=" * 60)
+    print("=" * 70)
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return "cuda"
+def get_rank_info():
 
-    return "cpu"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+
+    return local_rank, rank, world_size
 
 
 def format_conversation(example, tokenizer):
+
     messages = example["messages"]
 
     text = tokenizer.apply_chat_template(
@@ -65,41 +79,57 @@ def format_conversation(example, tokenizer):
     return {"text": text}
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
 
     torch.manual_seed(SEED)
 
-    device = get_device()
+    local_rank, rank, world_size = get_rank_info()
 
-    print_header("DEVICE INFORMATION")
+    # --------------------------------------------------------
+    # CUDA
+    # --------------------------------------------------------
 
-    if device == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU is required for QLoRA training."
+        )
 
-        print(f"Device: GPU")
-        print(f"GPU:    {gpu_name}")
-        print(f"VRAM:   {vram:.2f} GB")
+    torch.cuda.set_device(local_rank)
 
-        use_4bit = True
-        use_fp16 = False
-        use_bf16 = False
+    device = torch.device(f"cuda:{local_rank}")
 
-        batch_size = BATCH_SIZE_GPU
-        gradient_accumulation = GRADIENT_ACCUMULATION_STEPS_GPU
+    gpu_name = torch.cuda.get_device_name(local_rank)
 
-    else:
-        print("Device: CPU")
-        print("No CUDA GPU detected.")
+    vram = (
+        torch.cuda.get_device_properties(local_rank).total_memory
+        / (1024 ** 3)
+    )
 
-        use_4bit = False
-        use_fp16 = False
-        use_bf16 = False
+    # Only rank 0 prints general information
+    if rank == 0:
 
-        batch_size = BATCH_SIZE_CPU
-        gradient_accumulation = GRADIENT_ACCUMULATION_STEPS_CPU
+        print_header("DEVICE INFORMATION")
 
-    print_header("LOADING TOKENIZER")
+        print(f"World size: {world_size}")
+        print(f"Local rank: {local_rank}")
+        print(f"GPU:        {gpu_name}")
+        print(f"VRAM:       {vram:.2f} GB")
+
+        if world_size == 2:
+            print("Using 2 GPUs for distributed training.")
+        else:
+            print("Using 1 GPU.")
+
+    # --------------------------------------------------------
+    # TOKENIZER
+    # --------------------------------------------------------
+
+    if rank == 0:
+        print_header("LOADING TOKENIZER")
 
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
@@ -109,71 +139,88 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Tokenizer loaded.")
-    print(f"Vocabulary size: {len(tokenizer)}")
+    if rank == 0:
+        print("Tokenizer loaded.")
+        print(f"Vocabulary size: {len(tokenizer)}")
 
-    print_header("MODEL CONFIGURATION")
+    # --------------------------------------------------------
+    # QUANTIZATION
+    # --------------------------------------------------------
 
-    quantization_config = None
+    if rank == 0:
+        print_header("4-BIT QLoRA CONFIGURATION")
 
-    if use_4bit:
+        print("Using:")
+        print("  - 4-bit quantization")
+        print("  - NF4")
+        print("  - Double quantization")
+        print("  - FP16 compute")
 
-        print("Using 4-bit NF4 QLoRA.")
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
 
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
 
-    else:
-
-        print("Using CPU mode.")
-        print("4-bit quantization disabled.")
-
-    print_header("LOADING MODEL")
-
-    model_kwargs = {
-        "trust_remote_code": True,
-    }
-
-    if quantization_config is not None:
-        model_kwargs["quantization_config"] = quantization_config
-        model_kwargs["device_map"] = {"": 0}
-
-    else:
-        model_kwargs["torch_dtype"] = torch.float32
+    if rank == 0:
+        print_header("LOADING QWEN 2.5 3B")
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        **model_kwargs,
+
+        quantization_config=quantization_config,
+
+        # IMPORTANT:
+        # Each distributed process loads the model
+        # on its own GPU.
+        device_map={"": local_rank},
+
+        torch_dtype=torch.float16,
+
+        trust_remote_code=True,
     )
 
-    print("Model loaded successfully.")
+    if rank == 0:
+        print("Model loaded successfully.")
 
-    if device == "cuda":
+    # --------------------------------------------------------
+    # PREPARE FOR QLoRA
+    # --------------------------------------------------------
 
-        print("Preparing model for k-bit training...")
+    if rank == 0:
+        print_header("PREPARING MODEL FOR QLoRA")
 
-        model = prepare_model_for_kbit_training(model)
-
-        print("Model prepared.")
-
-    else:
-
-        model.gradient_checkpointing_enable()
+    model = prepare_model_for_kbit_training(model)
 
     model.config.use_cache = False
 
-    print_header("CREATING LoRA CONFIGURATION")
+    if rank == 0:
+        print("Model prepared.")
+
+    # --------------------------------------------------------
+    # LoRA
+    # --------------------------------------------------------
+
+    if rank == 0:
+        print_header("CREATING LoRA CONFIGURATION")
 
     lora_config = LoraConfig(
+
         r=LORA_R,
+
         lora_alpha=LORA_ALPHA,
+
         lora_dropout=LORA_DROPOUT,
+
         bias="none",
+
         task_type="CAUSAL_LM",
+
         target_modules=[
             "q_proj",
             "k_proj",
@@ -185,92 +232,169 @@ def main():
         ],
     )
 
-    print("LoRA configuration created.")
+    if rank == 0:
+        print("LoRA configuration created.")
 
-    print_header("LOADING CLEAN DATASETS")
+    # --------------------------------------------------------
+    # DATASET
+    # --------------------------------------------------------
 
-    train_dataset = load_from_disk(TRAIN_PATH)
-    validation_dataset = load_from_disk(VALIDATION_PATH)
+    if rank == 0:
+        print_header("LOADING CLEAN DATASETS")
 
-    print(f"Training examples:   {len(train_dataset):,}")
-    print(f"Validation examples: {len(validation_dataset):,}")
+    train_dataset = load_from_disk(
+        TRAIN_PATH
+    )
 
-    print_header("CONVERTING CONVERSATIONS TO TEXT")
+    validation_dataset = load_from_disk(
+        VALIDATION_PATH
+    )
+
+    if rank == 0:
+
+        print(
+            f"Training examples:   {len(train_dataset):,}"
+        )
+
+        print(
+            f"Validation examples: {len(validation_dataset):,}"
+        )
+
+    # --------------------------------------------------------
+    # CONVERT CHAT → TEXT
+    # --------------------------------------------------------
+
+    if rank == 0:
+        print_header("FORMATTING CONVERSATIONS")
 
     train_dataset = train_dataset.map(
-        lambda x: format_conversation(x, tokenizer),
+        lambda x: format_conversation(
+            x,
+            tokenizer,
+        ),
         remove_columns=train_dataset.column_names,
         desc="Formatting training dataset",
     )
 
     validation_dataset = validation_dataset.map(
-        lambda x: format_conversation(x, tokenizer),
+        lambda x: format_conversation(
+            x,
+            tokenizer,
+        ),
         remove_columns=validation_dataset.column_names,
         desc="Formatting validation dataset",
     )
 
-    print("Dataset conversion complete.")
+    if rank == 0:
 
-    print()
-    print("Sample:")
-    print("-" * 60)
-    print(train_dataset[0]["text"][:3000])
-    print("-" * 60)
+        print("Dataset formatting complete.")
 
-    print_header("CREATING TRAINING CONFIGURATION")
+        print()
+        print("Example:")
+        print("-" * 70)
+
+        print(
+            train_dataset[0]["text"][:3000]
+        )
+
+        print("-" * 70)
+
+    # --------------------------------------------------------
+    # TRAINING CONFIG
+    # --------------------------------------------------------
+
+    if rank == 0:
+        print_header("CREATING TRAINING CONFIGURATION")
 
     training_args = SFTConfig(
+
         output_dir=OUTPUT_DIR,
 
+        # Epochs
         num_train_epochs=NUM_EPOCHS,
 
-        per_device_train_batch_size=batch_size,
+        # Batch
+        per_device_train_batch_size=BATCH_SIZE_GPU,
+
         per_device_eval_batch_size=1,
 
-        gradient_accumulation_steps=gradient_accumulation,
+        gradient_accumulation_steps=(
+            GRADIENT_ACCUMULATION_STEPS_GPU
+        ),
 
+        # Learning
         learning_rate=LEARNING_RATE,
-
-        logging_steps=10,
-
-        save_steps=250,
-        save_total_limit=2,
-
-        eval_strategy="steps",
-        eval_steps=250,
-
-        fp16=use_fp16,
-        bf16=use_bf16,
-
-        gradient_checkpointing=True,
-
-        optim="paged_adamw_8bit" if device == "cuda" else "adamw_torch",
-
-        max_grad_norm=1.0,
 
         lr_scheduler_type="cosine",
 
         warmup_steps=50,
 
+        max_grad_norm=1.0,
+
+        # Logging
+        logging_steps=10,
+
         report_to="none",
 
-        seed=SEED,
+        # Checkpoints
+        save_strategy="steps",
 
+        save_steps=250,
+
+        save_total_limit=2,
+
+        # Evaluation
+        eval_strategy="steps",
+
+        eval_steps=250,
+
+        # Precision
+        fp16=True,
+
+        bf16=False,
+
+        # Memory
+        gradient_checkpointing=True,
+
+        gradient_checkpointing_kwargs={
+            "use_reentrant": False
+        },
+
+        # Optimizer
+        optim="paged_adamw_8bit",
+
+        # Sequence
         max_length=MAX_SEQ_LENGTH,
 
         packing=False,
 
+        # Dataset
         dataset_text_field="text",
 
+        # Tokens
         eos_token=tokenizer.eos_token,
+
         pad_token=tokenizer.pad_token,
 
+        # Distributed training
+        ddp_find_unused_parameters=False,
+
+        # Reproducibility
+        seed=SEED,
+
+        # Don't let Trainer remove our text column
         remove_unused_columns=False,
     )
 
-    print_header("CREATING SFT TRAINER")
+    # --------------------------------------------------------
+    # TRAINER
+    # --------------------------------------------------------
+
+    if rank == 0:
+        print_header("CREATING SFT TRAINER")
 
     trainer = SFTTrainer(
+
         model=model,
 
         args=training_args,
@@ -284,27 +408,75 @@ def main():
         peft_config=lora_config,
     )
 
-    print_header("STARTING TRAINING")
+    # --------------------------------------------------------
+    # TRAIN
+    # --------------------------------------------------------
 
-    print(f"Epochs:                 {NUM_EPOCHS}")
-    print(f"Batch size:             {batch_size}")
-    print(f"Gradient accumulation:  {gradient_accumulation}")
-    print(f"Effective batch size:   {batch_size * gradient_accumulation}")
-    print(f"Learning rate:          {LEARNING_RATE}")
-    print(f"Max sequence length:    {MAX_SEQ_LENGTH}")
-    print(f"Output directory:       {OUTPUT_DIR}")
+    if rank == 0:
+
+        print_header("STARTING QLoRA TRAINING")
+
+        print(f"Model:                  {MODEL_NAME}")
+
+        print(f"GPUs:                   {world_size}")
+
+        print(
+            f"Batch/GPU:              {BATCH_SIZE_GPU}"
+        )
+
+        print(
+            f"Gradient accumulation:  "
+            f"{GRADIENT_ACCUMULATION_STEPS_GPU}"
+        )
+
+        print(
+            f"Effective batch size:   "
+            f"{BATCH_SIZE_GPU * world_size * GRADIENT_ACCUMULATION_STEPS_GPU}"
+        )
+
+        print(
+            f"Learning rate:          {LEARNING_RATE}"
+        )
+
+        print(
+            f"Max sequence length:    {MAX_SEQ_LENGTH}"
+        )
+
+        print(
+            f"Epochs:                 {NUM_EPOCHS}"
+        )
+
+        print(
+            f"Output directory:       {OUTPUT_DIR}"
+        )
 
     trainer.train()
 
-    print_header("SAVING MODEL")
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
 
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    if rank == 0:
 
-    print(f"Model saved to:")
-    print(OUTPUT_DIR)
+        print_header("SAVING MODEL")
 
-    print_header("TRAINING COMPLETE")
+        trainer.save_model(
+            OUTPUT_DIR
+        )
+
+        tokenizer.save_pretrained(
+            OUTPUT_DIR
+        )
+
+        print(
+            f"LoRA adapter saved to:"
+        )
+
+        print(
+            OUTPUT_DIR
+        )
+
+        print_header("TRAINING COMPLETE")
 
 
 if __name__ == "__main__":
