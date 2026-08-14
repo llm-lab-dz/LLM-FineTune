@@ -39,25 +39,20 @@ GRADIENT_ACCUMULATION_STEPS = 4
 SEED = 42
 
 
-def print_section(title):
-    print()
-    print("=" * 70)
+def section(title):
+    print("\n" + "=" * 60)
     print(title)
-    print("=" * 70)
-
-
-def print_rank(message, rank):
-    if rank == 0:
-        print(message)
+    print("=" * 60)
 
 
 def format_conversation(example, tokenizer):
-    text = tokenizer.apply_chat_template(
-        example["messages"],
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    return {"text": text}
+    return {
+        "text": tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    }
 
 
 def main():
@@ -68,42 +63,24 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required for this training.")
+        raise RuntimeError("CUDA GPU is required.")
 
     torch.cuda.set_device(local_rank)
 
-    print_section(f"PROCESS {rank} / {world_size}")
-
-    print(f"Local rank:       {local_rank}")
-    print(f"Global rank:      {rank}")
-    print(f"World size:       {world_size}")
-    print(f"GPU:              {torch.cuda.get_device_name(local_rank)}")
-    print(f"CUDA:             {torch.version.cuda}")
-    print(f"PyTorch:          {torch.__version__}")
-    print(
-        f"GPU memory:       "
-        f"{torch.cuda.get_device_properties(local_rank).total_memory / 1024**3:.2f} GB"
-    )
-    print(f"Mixed precision:  {os.environ.get('ACCELERATE_MIXED_PRECISION')}")
-
-    print_section("TRAINING CONFIGURATION")
-
     if rank == 0:
-        print(f"Model:             {MODEL_NAME}")
-        print(f"Train dataset:     {TRAIN_PATH}")
-        print(f"Validation dataset:{VALIDATION_PATH}")
-        print(f"Output:            {OUTPUT_DIR}")
-        print(f"Sequence length:   {MAX_SEQ_LENGTH}")
-        print(f"Epochs:            {NUM_EPOCHS}")
-        print(f"Learning rate:     {LEARNING_RATE}")
-        print(f"Batch/GPU:         {BATCH_SIZE_GPU}")
-        print(f"Grad accumulation: {GRADIENT_ACCUMULATION_STEPS}")
-        print(f"Effective batch:   {BATCH_SIZE_GPU * world_size * GRADIENT_ACCUMULATION_STEPS}")
-        print(f"LoRA rank:         {LORA_R}")
-        print(f"LoRA alpha:        {LORA_ALPHA}")
-        print(f"LoRA dropout:      {LORA_DROPOUT}")
+        section("DEVICE")
+        print("GPUs:", world_size)
+        for i in range(torch.cuda.device_count()):
+            memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            print(
+                f"GPU {i}: {torch.cuda.get_device_name(i)} "
+                f"({memory:.2f} GB)"
+            )
+        print("PyTorch:", torch.__version__)
+        print("CUDA:", torch.version.cuda)
+        print("Mixed precision: fp16")
 
-    print_section("LOADING TOKENIZER")
+    section("TOKENIZER")
 
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
@@ -113,12 +90,11 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print_rank(
-        f"Tokenizer loaded | vocab size: {len(tokenizer)}",
-        rank,
-    )
+    if rank == 0:
+        print("Tokenizer loaded")
+        print("Vocabulary:", len(tokenizer))
 
-    print_section("QLORA CONFIGURATION")
+    section("QLORA")
 
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -128,12 +104,12 @@ def main():
     )
 
     if rank == 0:
-        print("4-bit quantization:     enabled")
-        print("Quantization type:      NF4")
-        print("Double quantization:    enabled")
-        print("Compute dtype:          float16")
+        print("4-bit: True")
+        print("NF4: True")
+        print("Double quantization: True")
+        print("Compute dtype: FP16")
 
-    print_section("LOADING MODEL")
+    section("MODEL")
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -143,22 +119,16 @@ def main():
         trust_remote_code=True,
     )
 
-    print_rank("Model loaded.", rank)
-
-    print_section("FORCING FP16")
-
-    model.config.torch_dtype = torch.float16
-    model.config.use_cache = False
-
     model = prepare_model_for_kbit_training(model)
 
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            param.data = param.data.to(torch.float16)
+    model.config.use_cache = False
+    model.config.torch_dtype = torch.float16
 
-    print_rank("Model prepared for k-bit training.", rank)
+    if rank == 0:
+        print("Model loaded")
+        print("Model dtype:", model.dtype)
 
-    print_section("LORA CONFIGURATION")
+    section("LORA")
 
     lora_config = LoraConfig(
         r=LORA_R,
@@ -177,57 +147,19 @@ def main():
         ],
     )
 
-    print_rank("LoRA configuration ready.", rank)
-
-    print_section("CHECKING TRAINABLE PARAMETERS")
-
-    trainable_params = 0
-    all_params = 0
-
-    first_trainable_name = None
-    first_trainable_dtype = None
-
-    for name, param in model.named_parameters():
-        all_params += param.numel()
-
-        if param.requires_grad:
-            trainable_params += param.numel()
-
-            if first_trainable_name is None:
-                first_trainable_name = name
-                first_trainable_dtype = param.dtype
-
     if rank == 0:
-        print(f"Total parameters:      {all_params:,}")
-        print(f"Trainable parameters:  {trainable_params:,}")
-        print(
-            f"Trainable percentage:  "
-            f"{100 * trainable_params / all_params:.4f}%"
-        )
-        print(f"First trainable tensor: {first_trainable_name}")
-        print(f"Trainable dtype:        {first_trainable_dtype}")
+        print("LoRA rank:", LORA_R)
+        print("LoRA alpha:", LORA_ALPHA)
+        print("LoRA dropout:", LORA_DROPOUT)
 
-    if first_trainable_dtype != torch.float16:
-        raise RuntimeError(
-            f"Expected trainable parameters to be FP16, "
-            f"but found {first_trainable_dtype}"
-        )
-
-    print_rank(
-        "Trainable parameter dtype check: FP16 OK",
-        rank,
-    )
-
-    print_section("LOADING DATASETS")
+    section("DATA")
 
     train_dataset = load_from_disk(TRAIN_PATH)
     validation_dataset = load_from_disk(VALIDATION_PATH)
 
     if rank == 0:
-        print(f"Training examples:   {len(train_dataset):,}")
-        print(f"Validation examples: {len(validation_dataset):,}")
-
-    print_section("FORMATTING DATASETS")
+        print("Train:", len(train_dataset))
+        print("Validation:", len(validation_dataset))
 
     train_dataset = train_dataset.map(
         lambda x: format_conversation(x, tokenizer),
@@ -242,14 +174,9 @@ def main():
     )
 
     if rank == 0:
-        print("Dataset formatting complete.")
-        print()
-        print("Sample:")
-        print("-" * 70)
-        print(train_dataset[0]["text"][:2000])
-        print("-" * 70)
+        print("Dataset formatting complete")
 
-    print_section("SFT CONFIGURATION")
+    section("TRAINING CONFIG")
 
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
@@ -268,7 +195,7 @@ def main():
         bf16=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
-            "use_reentrant": False,
+            "use_reentrant": False
         },
         optim="paged_adamw_8bit",
         max_grad_norm=0.0,
@@ -284,13 +211,19 @@ def main():
     )
 
     if rank == 0:
-        print("FP16:               True")
-        print("BF16:               False")
-        print("Optimizer:          paged_adamw_8bit")
-        print("Gradient checkpoint: True")
-        print("Max grad norm:      0.0")
+        print("Epochs:", NUM_EPOCHS)
+        print("Batch/GPU:", BATCH_SIZE_GPU)
+        print("Gradient accumulation:", GRADIENT_ACCUMULATION_STEPS)
+        print(
+            "Effective batch:",
+            BATCH_SIZE_GPU * world_size * GRADIENT_ACCUMULATION_STEPS
+        )
+        print("Learning rate:", LEARNING_RATE)
+        print("Max sequence length:", MAX_SEQ_LENGTH)
+        print("FP16: True")
+        print("BF16: False")
 
-    print_section("CREATING SFT TRAINER")
+    section("SFT TRAINER")
 
     trainer = SFTTrainer(
         model=model,
@@ -301,32 +234,26 @@ def main():
         peft_config=lora_config,
     )
 
-    print_rank(
-        "SFTTrainer created successfully.",
-        rank,
-    )
+    if rank == 0:
+        print("SFTTrainer created")
+        trainer.model.print_trainable_parameters()
 
-    print_section("STARTING TRAINING")
+    section("TRAINING")
 
     if rank == 0:
-        print("Everything passed the checks.")
-        print("Starting QLoRA training now...")
-        print()
+        print("Starting QLoRA training...")
 
     trainer.train()
 
-    print_section("SAVING MODEL")
-
     if rank == 0:
+        section("SAVING")
+
         trainer.save_model(OUTPUT_DIR)
         tokenizer.save_pretrained(OUTPUT_DIR)
 
-        print(f"Saved to: {OUTPUT_DIR}")
+        print("Saved to:", OUTPUT_DIR)
 
-    print_section("TRAINING COMPLETE")
-
-    if rank == 0:
-        print("QLoRA training finished successfully.")
+        section("DONE")
 
 
 if __name__ == "__main__":
