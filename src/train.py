@@ -9,6 +9,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
+    TrainerCallback,
 )
 from peft import (
     LoraConfig,
@@ -40,6 +41,17 @@ SAVE_STEPS = 100
 SAVE_TOTAL_LIMIT = 3
 
 SEED = 42
+
+# ============================================================
+# Hugging Face Hub settings
+# ============================================================
+
+HF_REPO_ID = "llm-lab-dz/qwen-3b-qlora-ultrachat"
+HF_PRIVATE_REPO = True
+
+# How often (in save steps) to push to the Hub during training.
+# e.g. 5 means: push every 5th time a checkpoint is saved.
+PUSH_TO_HUB_EVERY_N_SAVES = 5
 
 
 def section(title):
@@ -80,6 +92,66 @@ def find_latest_checkpoint():
     checkpoints.sort(key=lambda x: x[0])
 
     return checkpoints[-1][1]
+
+
+def push_folder_to_hub(folder_path, repo_id, commit_message):
+    """
+    Upload a folder to the Hugging Face Hub.
+    Never lets a Hub failure crash the training run.
+    """
+    from huggingface_hub import HfApi
+
+    try:
+        api = HfApi()
+
+        api.create_repo(
+            repo_id,
+            exist_ok=True,
+            private=HF_PRIVATE_REPO,
+        )
+
+        api.upload_folder(
+            folder_path=folder_path,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+        )
+
+        print(f"[hub] Pushed '{folder_path}' -> https://huggingface.co/{repo_id}")
+
+    except Exception as e:
+        print(f"[hub] WARNING: push failed, continuing training. Error: {e}")
+
+
+class PushToHubCallback(TrainerCallback):
+    """
+    Periodically pushes checkpoints to the Hugging Face Hub during training,
+    so a disconnected/expired session doesn't lose progress.
+    """
+
+    def __init__(self, repo_id, every_n_saves):
+        self.repo_id = repo_id
+        self.every_n_saves = every_n_saves
+        self.save_count = 0
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self.save_count += 1
+
+            if self.save_count % self.every_n_saves == 0:
+                checkpoint_dir = os.path.join(
+                    args.output_dir,
+                    f"checkpoint-{state.global_step}",
+                )
+
+                if os.path.isdir(checkpoint_dir):
+                    push_folder_to_hub(
+                        checkpoint_dir,
+                        self.repo_id,
+                        commit_message=f"Checkpoint at step {state.global_step}",
+                    )
+
+        return control
 
 
 def main():
@@ -291,7 +363,20 @@ def main():
         print("Checkpoint every:", SAVE_STEPS, "steps")
         print("Maximum checkpoints:", SAVE_TOTAL_LIMIT)
 
+        print("Hub repo:", HF_REPO_ID)
+        print("Push to Hub every:", PUSH_TO_HUB_EVERY_N_SAVES, "saves")
+
     section("SFT TRAINER")
+
+    callbacks = []
+
+    if rank == 0:
+        callbacks.append(
+            PushToHubCallback(
+                repo_id=HF_REPO_ID,
+                every_n_saves=PUSH_TO_HUB_EVERY_N_SAVES,
+            )
+        )
 
     trainer = SFTTrainer(
         model=model,
@@ -305,6 +390,8 @@ def main():
         processing_class=tokenizer,
 
         peft_config=lora_config,
+
+        callbacks=callbacks,
     )
 
     if rank == 0:
@@ -338,9 +425,26 @@ def main():
     if rank == 0:
         print("Starting QLoRA training...")
 
-    trainer.train(
-        resume_from_checkpoint=latest_checkpoint
-    )
+    try:
+        trainer.train(
+            resume_from_checkpoint=latest_checkpoint
+        )
+    except Exception as e:
+        # If training crashes partway through, still try to push
+        # whatever the latest checkpoint is before re-raising.
+        if rank == 0:
+            section("TRAINING INTERRUPTED — ATTEMPTING EMERGENCY SAVE")
+            print(f"Error: {e}")
+
+            emergency_checkpoint = find_latest_checkpoint()
+
+            if emergency_checkpoint:
+                push_folder_to_hub(
+                    emergency_checkpoint,
+                    HF_REPO_ID,
+                    commit_message="Emergency save after training interruption",
+                )
+        raise
 
     if rank == 0:
 
@@ -352,6 +456,14 @@ def main():
 
         print("Final model saved to:")
         print(OUTPUT_DIR)
+
+        section("PUSHING FINAL MODEL TO HUGGING FACE HUB")
+
+        push_folder_to_hub(
+            OUTPUT_DIR,
+            HF_REPO_ID,
+            commit_message="Final model after training completion",
+        )
 
         section("DONE")
 
