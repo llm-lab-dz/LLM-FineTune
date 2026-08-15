@@ -36,6 +36,9 @@ LEARNING_RATE = 2e-4
 BATCH_SIZE_GPU = 1
 GRADIENT_ACCUMULATION_STEPS = 4
 
+SAVE_STEPS = 100
+SAVE_TOTAL_LIMIT = 3
+
 SEED = 42
 
 
@@ -55,7 +58,32 @@ def format_conversation(example, tokenizer):
     }
 
 
+def find_latest_checkpoint():
+    if not os.path.exists(OUTPUT_DIR):
+        return None
+
+    checkpoints = []
+
+    for name in os.listdir(OUTPUT_DIR):
+        path = os.path.join(OUTPUT_DIR, name)
+
+        if os.path.isdir(path) and name.startswith("checkpoint-"):
+            try:
+                step = int(name.split("-")[1])
+                checkpoints.append((step, path))
+            except ValueError:
+                pass
+
+    if not checkpoints:
+        return None
+
+    checkpoints.sort(key=lambda x: x[0])
+
+    return checkpoints[-1][1]
+
+
 def main():
+
     torch.manual_seed(SEED)
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -69,13 +97,21 @@ def main():
 
     if rank == 0:
         section("DEVICE")
+
         print("GPUs:", world_size)
+
         for i in range(torch.cuda.device_count()):
-            memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            memory = (
+                torch.cuda.get_device_properties(i).total_memory
+                / 1024**3
+            )
+
             print(
-                f"GPU {i}: {torch.cuda.get_device_name(i)} "
+                f"GPU {i}: "
+                f"{torch.cuda.get_device_name(i)} "
                 f"({memory:.2f} GB)"
             )
+
         print("PyTorch:", torch.__version__)
         print("CUDA:", torch.version.cuda)
         print("Mixed precision: fp16")
@@ -180,78 +216,142 @@ def main():
 
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
+
         num_train_epochs=NUM_EPOCHS,
+
         per_device_train_batch_size=BATCH_SIZE_GPU,
         per_device_eval_batch_size=1,
+
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+
         learning_rate=LEARNING_RATE,
+
         logging_steps=10,
+
         save_strategy="steps",
-        save_steps=250,
-        save_total_limit=2,
+        save_steps=SAVE_STEPS,
+        save_total_limit=SAVE_TOTAL_LIMIT,
+
         eval_strategy="steps",
         eval_steps=250,
+
         fp16=True,
         bf16=False,
+
         gradient_checkpointing=True,
+
         gradient_checkpointing_kwargs={
             "use_reentrant": False
         },
+
         optim="paged_adamw_8bit",
+
         max_grad_norm=0.0,
+
         lr_scheduler_type="cosine",
+
         warmup_steps=50,
+
         report_to="none",
+
         seed=SEED,
+
         max_length=MAX_SEQ_LENGTH,
+
         packing=False,
+
         dataset_text_field="text",
+
         ddp_find_unused_parameters=False,
+
         remove_unused_columns=False,
     )
 
     if rank == 0:
         print("Epochs:", NUM_EPOCHS)
         print("Batch/GPU:", BATCH_SIZE_GPU)
-        print("Gradient accumulation:", GRADIENT_ACCUMULATION_STEPS)
+        print(
+            "Gradient accumulation:",
+            GRADIENT_ACCUMULATION_STEPS
+        )
+
         print(
             "Effective batch:",
-            BATCH_SIZE_GPU * world_size * GRADIENT_ACCUMULATION_STEPS
+            BATCH_SIZE_GPU
+            * world_size
+            * GRADIENT_ACCUMULATION_STEPS
         )
+
         print("Learning rate:", LEARNING_RATE)
         print("Max sequence length:", MAX_SEQ_LENGTH)
+
         print("FP16: True")
         print("BF16: False")
+
+        print("Checkpoint every:", SAVE_STEPS, "steps")
+        print("Maximum checkpoints:", SAVE_TOTAL_LIMIT)
 
     section("SFT TRAINER")
 
     trainer = SFTTrainer(
         model=model,
+
         args=training_args,
+
         train_dataset=train_dataset,
+
         eval_dataset=validation_dataset,
+
         processing_class=tokenizer,
+
         peft_config=lora_config,
     )
 
     if rank == 0:
         print("SFTTrainer created")
+
         trainer.model.print_trainable_parameters()
+
+    section("CHECKPOINT")
+
+    latest_checkpoint = find_latest_checkpoint()
+
+    if rank == 0:
+
+        if latest_checkpoint:
+
+            print("Checkpoint found:")
+            print(latest_checkpoint)
+
+            print()
+            print("Training will resume from this checkpoint.")
+
+        else:
+
+            print("No checkpoint found.")
+
+            print()
+            print("Training will start from the beginning.")
 
     section("TRAINING")
 
     if rank == 0:
         print("Starting QLoRA training...")
 
-    trainer.train()
+    trainer.train(
+        resume_from_checkpoint=latest_checkpoint
+    )
 
     if rank == 0:
-        section("SAVING")
+
+        section("SAVING FINAL MODEL")
 
         trainer.save_model(OUTPUT_DIR)
+
         tokenizer.save_pretrained(OUTPUT_DIR)
 
-        print("Saved to:", OUTPUT_DIR)
+        print("Final model saved to:")
+        print(OUTPUT_DIR)
 
         section("DONE")
 
