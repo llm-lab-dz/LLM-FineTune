@@ -40,11 +40,11 @@ LLM/
 ├── .env.example
 ├── data/
 │   ├── processed/
-│   │   ├── train/
-│   │   ├── train_clean/
-│   │   ├── validation/
-│   │   └── validation_clean/
-│   └── raw/
+│       ├── train/
+│       ├── train_clean/
+│       ├── validation/
+│       └── validation_clean/
+│  
 ├── model/
 │   ├── adapters/
 │   └── checkpoints/
@@ -62,7 +62,6 @@ LLM/
 │   └── train.py
 ├── docs/
 │   └── PROJECT_GUIDE.md
-└── CONTRIBUTING.md
 ```
 
 ## How the pipeline works
