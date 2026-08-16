@@ -146,6 +146,7 @@ def compute_quantitative_metrics(model, tokenizer, use_gpu):
     trainer = SFTTrainer(
         model=model,
         args=eval_args,
+        train_dataset=validation_dataset,
         eval_dataset=validation_dataset,
         processing_class=tokenizer,
     )
