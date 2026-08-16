@@ -46,12 +46,10 @@ SEED = 42
 # Hugging Face Hub settings
 # ============================================================
 
-HF_REPO_ID = "llm-lab-dz/qwen-3b-qlora-ultrachat"
-HF_PRIVATE_REPO = True
-
-# How often (in save steps) to push to the Hub during training.
-# e.g. 5 means: push every 5th time a checkpoint is saved.
-PUSH_TO_HUB_EVERY_N_SAVES = 5
+ENABLE_HUB_PUSH = os.getenv("ENABLE_HUB_PUSH", "false").lower() == "true"
+HF_REPO_ID = os.getenv("HF_REPO_ID")
+HF_PRIVATE_REPO = os.getenv("HF_PRIVATE_REPO", "true").lower() == "true"
+PUSH_TO_HUB_EVERY_N_SAVES = int(os.getenv("PUSH_TO_HUB_EVERY_N_SAVES", "5"))
 
 
 def section(title):
@@ -99,6 +97,10 @@ def push_folder_to_hub(folder_path, repo_id, commit_message):
     Upload a folder to the Hugging Face Hub.
     Never lets a Hub failure crash the training run.
     """
+    if not ENABLE_HUB_PUSH or not repo_id:
+        print(f"[hub] Skipped upload for '{folder_path}'. ENABLE_HUB_PUSH is off or no HF_REPO_ID is configured.")
+        return
+
     from huggingface_hub import HfApi
 
     try:
@@ -370,13 +372,15 @@ def main():
 
     callbacks = []
 
-    if rank == 0:
+    if rank == 0 and ENABLE_HUB_PUSH and HF_REPO_ID:
         callbacks.append(
             PushToHubCallback(
                 repo_id=HF_REPO_ID,
                 every_n_saves=PUSH_TO_HUB_EVERY_N_SAVES,
             )
         )
+    elif rank == 0:
+        print("[hub] Hub uploads are disabled. Local training only.")
 
     trainer = SFTTrainer(
         model=model,
